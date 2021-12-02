@@ -12,6 +12,8 @@
 #include <errno.h>
 #include <stdint.h>
 
+#define PID_LOCK_FILE "/var/lock/jabrac.lock"
+
 typedef struct mydeviceentry {
     struct mydeviceentry *next;
     unsigned short deviceID;
@@ -22,9 +24,135 @@ typedef struct mydeviceentry {
 } mydeviceentry;
 
 
+static void lockDeviceList();
+static void unlockDeviceList();
+static void freeDeviceEntry(mydeviceentry *entry);
+
+static volatile int libraryInitialized;
+static int verbose=0;
+static int runAsDaemon=0;
+
+static volatile int inMainLoop = 0;
+static volatile int shutdown = 0;
+static volatile int finalReturnCode=0;
+
+static int pollingIntervalSeconds = 60;
+
+static int notificationThreshold = 5;
+
+static volatile int weCreatedLockFile = 0;
+
 static volatile mydeviceentry *devices=0;
 
 static pthread_mutex_t deviceListMutex;
+
+static pthread_cond_t sleep_condition;
+static pthread_mutex_t sleep_mutex;
+
+static int resolveLinkTarget(char *link, char *targetBuffer, size_t targetBufferSize)
+{
+    char exePath[PATH_MAX];
+
+    if ( readlink(link,exePath,sizeof(exePath) ) > 0 ) {
+        char *path = realpath(exePath,NULL);
+        if ( path ) {
+          size_t len = strlen(path);
+          if ( (len+1) < targetBufferSize ) {
+            strncpy(targetBuffer,path,targetBufferSize);
+            free(path);
+            return 1;
+          }
+          free(path);
+        }
+    }
+    return 0;
+}
+
+static int isAlreadyRunning() {
+
+   int isRunning = 0;
+   FILE *in = fopen( PID_LOCK_FILE, "r");
+   if ( in ) {
+       char buffer[200];
+       //        size_t fread(void *ptr, size_t size, size_t nmemb, FILE *stream);
+       size_t bytesRead = fread(buffer,1,sizeof(buffer)-1,in);
+       if ( bytesRead > 0 && bytesRead < 200 ) {
+         buffer[bytesRead+1]=0;
+         int pid = atoi(buffer);
+         if ( pid > 0 ) {
+           snprintf(buffer,sizeof(buffer),"/proc/%d/exe",pid);
+
+           //        ssize_t readlink(const char *pathname, char *buf, size_t bufsiz);
+           char exePath[PATH_MAX];
+           if ( resolveLinkTarget( buffer,exePath,sizeof(exePath) ) )
+           {
+            isRunning = 1;
+            char pathToSelf[PATH_MAX];
+            if ( resolveLinkTarget( "/proc/self/exe",pathToSelf,sizeof(pathToSelf) ) ) {
+              if ( strcmp(exePath,pathToSelf) != 0 ) {
+                if ( runAsDaemon ) {
+                  syslog(LOG_WARNING,"Found PID file %s but it points to running process %d (%s), expected %s",PID_LOCK_FILE,pid,exePath,pathToSelf);
+                } else {
+                  printf("WARNING: Found PID file %s but it points to running process %d (%s), expected %s",PID_LOCK_FILE,pid,exePath,pathToSelf);
+                }
+              }
+            }
+           }
+         }
+       }
+       fclose(in);
+   }
+   return isRunning;
+}
+
+static int createLockFile()
+{
+    FILE *out = fopen( PID_LOCK_FILE, "w");
+    if ( out == NULL ) {
+      return 0;
+    }
+    weCreatedLockFile = 1;
+    char buffer[200];
+    snprintf(buffer,sizeof(buffer),"%d",getpid());
+
+    size_t toWrite = strlen(buffer);
+    size_t written = fwrite(&buffer,1,toWrite,out);
+    if ( written != toWrite) {
+        if ( runAsDaemon ) {
+            syslog(LOG_WARNING,"Failed to write %ld bytes to PID file %s",toWrite, PID_LOCK_FILE);
+        } else {
+            printf("WARNING: Failed to write %ld bytes to PID file %s",toWrite, PID_LOCK_FILE);
+        }
+    }
+    fclose(out);
+    return toWrite == written;
+}
+
+static void deleteLockFile()
+{
+  if ( weCreatedLockFile ) {
+    unlink( PID_LOCK_FILE );
+  }
+}
+
+static void sleepInterruptibly(int seconds) {
+
+    static struct timespec time_to_wait = {0, 0};
+    time_to_wait.tv_sec = seconds;
+
+    pthread_mutex_lock(&sleep_mutex);
+    if ( ! shutdown ) {
+      pthread_cond_timedwait(&sleep_condition, &sleep_mutex, &time_to_wait);
+    }
+    pthread_mutex_unlock(&sleep_mutex);
+}
+
+static void wakeup()
+{
+    pthread_mutex_lock(&sleep_mutex);
+    pthread_cond_broadcast(&sleep_condition);
+    pthread_mutex_unlock(&sleep_mutex);
+}
 
 static void showNotification(char *msg)
 {
@@ -35,6 +163,71 @@ static void showNotification(char *msg)
     {
         syslog(LOG_ERR,"Failed to show notification %s",msg);
     }
+    if ( ! runAsDaemon ) {
+      printf("%s\n",msg);
+    }
+}
+
+static void cleanup(int callExit)
+{
+      lockDeviceList();
+
+      mydeviceentry *current= (mydeviceentry*) devices;
+      devices = 0;
+
+      mydeviceentry *next;
+      while(current) {
+          next=current->next;
+          freeDeviceEntry(current);
+          current=next;
+      }
+
+      unlockDeviceList();
+
+      deleteLockFile();
+
+      if ( callExit ) {
+        if ( inMainLoop ) {
+          shutdown = 1;
+          wakeup();
+        } else {
+          exit(1);
+        }
+      }
+}
+
+static void handleSignal(const char*msg, int callExit) {
+   if ( verbose ) {
+        if ( runAsDaemon ) {
+          syslog(LOG_INFO,"%s",msg);
+        } else {
+          printf("%s\n",msg);
+        }
+    }
+    cleanup(callExit);
+}
+
+static void sigTermHandler(int signal) {
+  handleSignal("Received SIGTERM",1);
+}
+
+static void sigIntHandler(int signal) {
+  handleSignal("Received SIGINT",1);
+}
+
+static void sigHupHandler(int signal) {
+  wakeup();
+}
+
+static void sigQuitHandler(int signal) {
+  handleSignal("Received SIGQUIT",0);
+}
+
+static void installSignalHandlers() {
+  signal(SIGTERM, sigTermHandler);
+  signal(SIGINT, sigIntHandler);
+  signal(SIGQUIT, sigQuitHandler);
+  signal(SIGHUP, sigHupHandler);
 }
 
 static void lockDeviceList()
@@ -62,7 +255,7 @@ static void checkBatteryStatus() {
     {
         // count devices
         int deviceCount = 0;
-        mydeviceentry *current = devices;
+        mydeviceentry *current = (mydeviceentry*) devices;
         while ( current ) {
             current = current->next;
             deviceCount++;
@@ -70,7 +263,7 @@ static void checkBatteryStatus() {
 
         // copy IDs so we can poll battery status without having to hold the lock
         unsigned short *ids = calloc(deviceCount,sizeof(unsigned short));
-        current = devices;
+        current = (mydeviceentry*) devices;
         for( int i = 0 ; current ; i++, current = current->next ) {
             ids[i] = current->deviceID;
         }
@@ -85,7 +278,8 @@ static void checkBatteryStatus() {
               {
                   // find entry and notify if necessary
                   lockDeviceList();
-                  current = devices;
+
+                  current = (mydeviceentry*) devices;
                   while ( current && current->deviceID != ids[i] ) {
                       current = current->next;
                   }
@@ -94,7 +288,7 @@ static void checkBatteryStatus() {
                     uint8_t level = batteryStatus->levelInPercent;
                     uint8_t charging = batteryStatus->charging;
 
-                    if ( ! current->notifiedAtLeastOnce || current->lastNotifyCharging != charging || ( current->lastNotifyPercentage != level && (level % 10 ) == 0 ) )
+                    if ( ! current->notifiedAtLeastOnce || current->lastNotifyCharging != charging || ( current->lastNotifyPercentage != level && (level % notificationThreshold ) == 0 ) )
                     {
                         char msg[200];
                         const char *format;
@@ -113,6 +307,7 @@ static void checkBatteryStatus() {
                   }
                   Jabra_FreeBatteryStatus(batteryStatus);
                   unlockDeviceList();
+
               } else if ( rc != Not_Supported) { // device has no battery
                   syslog(LOG_ERR,"Failed to query battery status for device %04x: error %d", ids[i], rc );
               }
@@ -126,6 +321,11 @@ static void checkBatteryStatus() {
     }
 }
 
+static void freeDeviceEntry(mydeviceentry *entry) {
+    free(entry->deviceName);
+    free(entry);
+}
+
 static void delDevice(unsigned short deviceID)
 {
     syslog(LOG_INFO,"DETACHED: device with ID %04x", deviceID);
@@ -133,7 +333,7 @@ static void delDevice(unsigned short deviceID)
     lockDeviceList();
 
     mydeviceentry *previous=0;
-    mydeviceentry *current=devices;
+    mydeviceentry *current=(mydeviceentry*) devices;
     while ( current )
     {
       if ( current->deviceID == deviceID )
@@ -143,8 +343,7 @@ static void delDevice(unsigned short deviceID)
           } else {
             previous->next = current->next;
           }
-          free(current->deviceName);
-          free(current);
+          freeDeviceEntry(current);
           break;
       }
       previous = current;
@@ -165,13 +364,15 @@ static void addDevice(Jabra_DeviceInfo* info) {
     newEntry->deviceName = strdup(info->deviceName);
 
     if ( devices )  {
-      newEntry->next = devices;
+      newEntry->next = (mydeviceentry*) devices;
       devices = newEntry;
     } else {
       devices = newEntry;
     }
 
     unlockDeviceList();
+
+    wakeup();
 }
 
 static void daemonize()
@@ -225,23 +426,78 @@ static void deviceRemoved(unsigned short deviceID) {
 
 int main(int argc, char** args) {
 
-  int runAsDaemon=0;
   if ( argc > 0 )
   {
 
     for ( int i = 0 ; i < argc ; i++) {
       if ( strcmp("-h", args[i]) == 0 || strcmp("--help",args[i]) == 0 ) {
-        printf("Usage: [-h|--help] [-d|--daemon]\n");
+        printf("Usage: [-h|--help] [-d|--daemon] [-v|--verbose] [--notify-step <battery level percentage delta>] [--polling-interval <seconds>]\n");
         return 1;
       } else if ( strcmp("-d", args[i]) == 0 || strcmp("--daemon",args[i]) == 0 ) {
         runAsDaemon=1;
+      } else if ( strcmp("-v", args[i]) == 0 || strcmp("--verbose",args[i]) == 0 ) {
+        verbose=1;
+      } else if ( strcmp("--polling-interval", args[i]) == 0 ) {
+        if ( (i+1) < argc ) {
+            pollingIntervalSeconds = atoi(args[i+1]);
+            if ( pollingIntervalSeconds < 1 ) {
+              printf("ERROR: %d is an invalid argument for--polling, must be > 0\n", pollingIntervalSeconds);
+              return 1;
+            }
+            i++;
+        } else {
+          printf("ERROR: --notify-step requires an argument\n");
+          return 1;
+        }
+      } else if ( strcmp("--notify-step", args[i]) == 0 ) {
+        if ( (i+1) < argc ) {
+            notificationThreshold = atoi(args[i+1]);
+            if ( notificationThreshold < 1 || notificationThreshold > 100 ) {
+              printf("ERROR: %d is an invalid argument for--notify-step, must be > 0 and <= 100\n", notificationThreshold);
+              return 1;
+            }
+            i++;
+        } else {
+          printf("ERROR: --notify-step requires an argument\n");
+          return 1;
+        }
       }
     }
   }
 
+  if ( isAlreadyRunning() )
+  {
+    printf("ERROR: Another instance is already running, terminate that one first.\n");
+    return 1;
+  }
+
+  if ( verbose ) {
+    printf("Will notify about battery level changes every %d percent.\n",notificationThreshold);
+    printf("Will poll battery status every %d seconds.\n",pollingIntervalSeconds);
+  }
+
   if ( runAsDaemon ) {
+    if ( verbose ) {
+      printf("Running as daemon\n");
+    }
     daemonize();
   }
+
+  if ( ! createLockFile() )
+  {
+    if ( runAsDaemon ) {
+      syslog(LOG_ERR, "Failed to create lock file %s\n", PID_LOCK_FILE);
+    } else {
+      printf("ERROR: Failed to create lock file %s\n", PID_LOCK_FILE);
+    }
+    return 1;
+  }
+
+  installSignalHandlers();
+
+  pthread_mutex_init(&deviceListMutex,NULL);
+  pthread_mutex_init(&sleep_mutex,NULL);
+  pthread_cond_init(&sleep_condition, NULL);
 
   notify_init("jabrac");
 
@@ -262,14 +518,24 @@ int main(int argc, char** args) {
     }
     return 1;
   }
+  libraryInitialized = 1;
 
   showNotification("jabrac started");
-  sleep(2);
 
-  while(1)
+  while( ! shutdown )
   {
+    inMainLoop=1;
     checkBatteryStatus();
-    sleep(60);
+    sleepInterruptibly(60);
   }
-  return 0;
+  inMainLoop=0;
+  if ( verbose ) {
+    if ( runAsDaemon ) {
+      syslog(LOG_INFO,"Program is terminating.\n");
+    } else {
+      printf("Program is terminating.\n");
+    }
+  }
+  Jabra_Uninitialize();
+  return finalReturnCode;
 }
