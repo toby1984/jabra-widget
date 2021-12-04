@@ -1,0 +1,31 @@
+{
+    "KPlugin": {
+        "Authors": [
+            {
+                "Email": "tobias.gierke@code-sourcery.de",
+                "Name": "Tobias Gierke"
+            }
+        ],
+        "Category": "System Information",
+        "Dependencies": [
+        ],
+        "Description": "Shows battery status of connected Jabra(tm) devices",
+        "EnabledByDefault": false,
+        "Icon": "battery",
+        "Id": "de.codesourcery.jabra.JabraStat",
+        "License": "GPL-2.0+",
+        "Name": "JabraStat",
+        "ServiceTypes": [
+            "Plasma/Applet"
+        ],
+        "Version": "1.0.0",
+        "Website": "https://www.code-sourcery.de"
+    },
+    "X-Plasma-API": "declarativeappletscript",
+    "X-Plasma-MainScript": "ui/jabrastat.qml",
+    "X-Plasma-Provides": [
+        "org.kde.plasma.time",
+        "org.kde.plasma.date"
+    ],
+    "X-Plasma-StandAloneApp": true
+}

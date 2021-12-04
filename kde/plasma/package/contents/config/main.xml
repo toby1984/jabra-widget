@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kcfg xmlns="http://www.kde.org/standards/kcfg/1.0"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.kde.org/standards/kcfg/1.0
+      http://www.kde.org/standards/kcfg/1.0/kcfg.xsd" >
+  <kcfgfile name=""/>
+
+  <group name="General">
+    <entry name="debug" type="Bool">
+      <default>false</default>
+    </entry>
+    <entry name="notifyStep" type="Int">
+      <default>5</default>
+    </entry>
+    <entry name="pollingIntervalSeconds" type="Int">
+      <default>60</default>
+    </entry>
+  </group>
+
+</kcfg>

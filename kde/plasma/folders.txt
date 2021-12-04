@@ -1,0 +1,14 @@
+
+
+    ~/Code/plasmoid-helloworld/
+        package/
+            contents/
+                config/
+                    config.qml
+                    main.xml
+                ui/
+                    configGeneral.qml
+                    main.qml
+            metadata.desktop
+
+
