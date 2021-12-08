@@ -36,7 +36,7 @@ static volatile int inMainLoop = 0;
 static volatile int shutdown = 0;
 static volatile int finalReturnCode=0;
 
-static int pollingIntervalSeconds = 60;
+static int pollingIntervalSeconds = 5*60;
 
 static int notificationThreshold = 5;
 
@@ -288,7 +288,13 @@ static void checkBatteryStatus() {
                     uint8_t level = batteryStatus->levelInPercent;
                     uint8_t charging = batteryStatus->charging;
 
-                    if ( ! current->notifiedAtLeastOnce || current->lastNotifyCharging != charging || ( current->lastNotifyPercentage != level && (level % notificationThreshold ) == 0 ) )
+                    uint8_t notified = current->notifiedAtLeastOnce;
+                    uint8_t chargingStateChanged = notified && current->lastNotifyCharging != charging;
+                    uint8_t levelNotNotifiedYet = notified && current->lastNotifyPercentage != level;
+                    uint8_t levelIsMultipleOfThreshold = (level % notificationThreshold ) == 0;
+                    uint8_t deltaExceedsThreshold = notified && abs(current->lastNotifyPercentage - level) >= notificationThreshold;
+
+                    if ( ! notified || chargingStateChanged || ( levelNotNotifiedYet && ( levelIsMultipleOfThreshold || deltaExceedsThreshold ) ) )
                     {
                         char msg[200];
                         const char *format;
