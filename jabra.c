@@ -77,7 +77,7 @@ static int isAlreadyRunning() {
        //        size_t fread(void *ptr, size_t size, size_t nmemb, FILE *stream);
        size_t bytesRead = fread(buffer,1,sizeof(buffer)-1,in);
        if ( bytesRead > 0 && bytesRead < 200 ) {
-         buffer[bytesRead+1]=0;
+         buffer[bytesRead]=0;
          int pid = atoi(buffer);
          if ( pid > 0 ) {
            snprintf(buffer,sizeof(buffer),"/proc/%d/exe",pid);
