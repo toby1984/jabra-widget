@@ -11,6 +11,7 @@
 #include <string.h>
 #include <errno.h>
 #include <stdint.h>
+#include <time.h>
 
 #define PID_LOCK_FILE "/var/lock/jabrac.lock"
 
@@ -45,6 +46,8 @@ static volatile int weCreatedLockFile = 0;
 static volatile mydeviceentry *devices=0;
 
 static pthread_mutex_t deviceListMutex;
+
+static volatile int wakeUpFromSleep = 0;
 
 static pthread_cond_t sleep_condition;
 static pthread_mutex_t sleep_mutex;
@@ -135,21 +138,34 @@ static void deleteLockFile()
   }
 }
 
-static void sleepInterruptibly(int seconds) {
-
-    static struct timespec time_to_wait = {0, 0};
-    time_to_wait.tv_sec = seconds;
+static void sleepInterruptibly(int seconds)
+{
+    struct timespec time_to_wait;
+    clock_gettime(CLOCK_MONOTONIC,&time_to_wait);
+    time_to_wait.tv_sec += seconds;
 
     pthread_mutex_lock(&sleep_mutex);
-    if ( ! shutdown ) {
-      pthread_cond_timedwait(&sleep_condition, &sleep_mutex, &time_to_wait);
+    while ( ! shutdown && ! wakeUpFromSleep ) {
+      int rc = pthread_cond_timedwait(&sleep_condition, &sleep_mutex, &time_to_wait);
+      if ( rc == ETIMEDOUT ) {
+          break;
+      }
+      if ( rc == EINVAL ) {
+        if ( runAsDaemon ) {
+            syslog(LOG_WARNING,"timedwait() failed");
+        } else {
+            printf("ERROR: timedwait() failed");
+        }
+      }
     }
+    wakeUpFromSleep = 0;
     pthread_mutex_unlock(&sleep_mutex);
 }
 
 static void wakeup()
 {
     pthread_mutex_lock(&sleep_mutex);
+    wakeUpFromSleep = 1;
     pthread_cond_broadcast(&sleep_condition);
     pthread_mutex_unlock(&sleep_mutex);
 }
@@ -503,7 +519,16 @@ int main(int argc, char** args) {
 
   pthread_mutex_init(&deviceListMutex,NULL);
   pthread_mutex_init(&sleep_mutex,NULL);
-  pthread_cond_init(&sleep_condition, NULL);
+
+  // setup timed_wait() to use CLOCK_MONOTONIC
+  // clock as the default CLOCK_REALTIME is prone to
+  // jumps as it may be adjusted by the user/NTPD etc.
+  pthread_condattr_t attr;
+
+  pthread_condattr_init(&attr);
+  pthread_condattr_setclock(&attr,CLOCK_MONOTONIC);
+
+  pthread_cond_init(&sleep_condition, &attr);
 
   notify_init("jabrac");
 
