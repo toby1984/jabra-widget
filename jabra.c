@@ -48,6 +48,7 @@ static volatile mydeviceentry *devices=0;
 static pthread_mutex_t deviceListMutex;
 
 static volatile int wakeUpFromSleep = 0;
+static volatile int forcedWakeUpFromSleep = 0;
 
 static pthread_cond_t sleep_condition;
 static pthread_mutex_t sleep_mutex;
@@ -138,11 +139,14 @@ static void deleteLockFile()
   }
 }
 
-static void sleepInterruptibly(int seconds)
+// return: whether the wakup was forced by a SIGHUP or not
+static int sleepInterruptibly(int seconds)
 {
     struct timespec time_to_wait;
     clock_gettime(CLOCK_MONOTONIC,&time_to_wait);
     time_to_wait.tv_sec += seconds;
+
+    int forcedWakeup;
 
     pthread_mutex_lock(&sleep_mutex);
     while ( ! shutdown && ! wakeUpFromSleep ) {
@@ -158,16 +162,23 @@ static void sleepInterruptibly(int seconds)
         }
       }
     }
+    syslog(LOG_DEBUG,"background thread woke up from pthread_cond_timedwait()");
+    forcedWakeup = forcedWakeUpFromSleep;
+    forcedWakeUpFromSleep = 0;
     wakeUpFromSleep = 0;
     pthread_mutex_unlock(&sleep_mutex);
+    return forcedWakeup;
 }
 
-static void wakeup()
+static void wakeup(int forced)
 {
+    syslog(LOG_DEBUG,"About to wake background thread");
     pthread_mutex_lock(&sleep_mutex);
     wakeUpFromSleep = 1;
+    forcedWakeUpFromSleep = forced;
     pthread_cond_broadcast(&sleep_condition);
     pthread_mutex_unlock(&sleep_mutex);
+    syslog(LOG_DEBUG,"Woke up background thread");
 }
 
 static void showNotification(char *msg)
@@ -205,7 +216,7 @@ static void cleanup(int callExit)
       if ( callExit ) {
         if ( inMainLoop ) {
           shutdown = 1;
-          wakeup();
+          wakeup(0);
         } else {
           exit(1);
         }
@@ -232,7 +243,8 @@ static void sigIntHandler(int signal) {
 }
 
 static void sigHupHandler(int signal) {
-  wakeup();
+  syslog(LOG_DEBUG,"Received SIGHUP");
+  wakeup(1);
 }
 
 static void sigQuitHandler(int signal) {
@@ -263,7 +275,7 @@ static void unlockDeviceList() {
     }
 }
 
-static void checkBatteryStatus() {
+static void checkBatteryStatus(int force) {
 
     lockDeviceList();
 
@@ -310,7 +322,7 @@ static void checkBatteryStatus() {
                     uint8_t levelIsMultipleOfThreshold = (level % notificationThreshold ) == 0;
                     uint8_t deltaExceedsThreshold = notified && abs(current->lastNotifyPercentage - level) >= notificationThreshold;
 
-                    if ( ! notified || chargingStateChanged || ( levelNotNotifiedYet && ( levelIsMultipleOfThreshold || deltaExceedsThreshold ) ) )
+                    if ( force || ! notified || chargingStateChanged || ( levelNotNotifiedYet && ( levelIsMultipleOfThreshold || deltaExceedsThreshold ) ) )
                     {
                         char msg[200];
                         const char *format;
@@ -322,9 +334,11 @@ static void checkBatteryStatus() {
                         snprintf(msg,sizeof(msg),format,current->deviceName,level);
                         showNotification( msg );
 
-                        current->notifiedAtLeastOnce=1;
-                        current->lastNotifyPercentage=level;
-                        current->lastNotifyCharging=charging ? 1:0;
+                        if ( ! force ) {
+                            current->notifiedAtLeastOnce=1;
+                            current->lastNotifyPercentage=level;
+                            current->lastNotifyCharging=charging ? 1:0;
+                        }
                     }
                   }
                   Jabra_FreeBatteryStatus(batteryStatus);
@@ -394,7 +408,7 @@ static void addDevice(Jabra_DeviceInfo* info) {
 
     unlockDeviceList();
 
-    wakeup();
+    wakeup(0);
 }
 
 static void daemonize()
@@ -553,11 +567,12 @@ int main(int argc, char** args) {
 
   showNotification("jabrac started");
 
+  int forcedWakeup = 0;
   while( ! shutdown )
   {
     inMainLoop=1;
-    checkBatteryStatus();
-    sleepInterruptibly(60);
+    checkBatteryStatus(forcedWakeup);
+    forcedWakeup = sleepInterruptibly(60);
   }
   inMainLoop=0;
   if ( verbose ) {
