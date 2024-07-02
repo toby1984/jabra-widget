@@ -185,17 +185,18 @@ static void showNotification(char *msg)
 {
     NotifyNotification* n = notify_notification_new ("jabrac", msg,0);
     notify_notification_set_timeout(n, 3000); // show for 3 seconds
+    GError *error = NULL;
 
-    if ( ! notify_notification_show(n, 0) )
+    if ( ! notify_notification_show(n, &error) )
     {
-        syslog(LOG_ERR,"Failed to show notification %s",msg);
+        syslog(LOG_ERR,"Failed to show notification %s because of error %s",msg, error->message);
     }
     if ( ! runAsDaemon ) {
       printf("%s\n",msg);
     }
 }
 
-static void cleanup(int callExit)
+static void cleanupAndExit()
 {
       lockDeviceList();
 
@@ -213,17 +214,17 @@ static void cleanup(int callExit)
 
       deleteLockFile();
 
-      if ( callExit ) {
-        if ( inMainLoop ) {
-          shutdown = 1;
-          wakeup(0);
-        } else {
-          exit(1);
-        }
+
+      if ( inMainLoop ) {
+        shutdown = 1;
+        wakeup(0);
+      } else {
+        exit(1);
       }
+
 }
 
-static void handleSignal(const char*msg, int callExit) {
+static void handleSignal(const char*msg) {
    if ( verbose ) {
         if ( runAsDaemon ) {
           syslog(LOG_INFO,"%s",msg);
@@ -231,15 +232,15 @@ static void handleSignal(const char*msg, int callExit) {
           printf("%s\n",msg);
         }
     }
-    cleanup(callExit);
+    cleanupAndExit();
 }
 
 static void sigTermHandler(int signal) {
-  handleSignal("Received SIGTERM",1);
+  handleSignal("Received SIGTERM");
 }
 
 static void sigIntHandler(int signal) {
-  handleSignal("Received SIGINT",1);
+  handleSignal("Received SIGINT");
 }
 
 static void sigHupHandler(int signal) {
@@ -247,15 +248,10 @@ static void sigHupHandler(int signal) {
   wakeup(1);
 }
 
-static void sigQuitHandler(int signal) {
-  handleSignal("Received SIGQUIT",0);
-}
-
 static void installSignalHandlers() {
   signal(SIGTERM, sigTermHandler);
-  signal(SIGINT, sigIntHandler);
-  signal(SIGQUIT, sigQuitHandler);
-  signal(SIGHUP, sigHupHandler);
+  signal(SIGINT , sigIntHandler );
+  signal(SIGHUP , sigHupHandler );
 }
 
 static void lockDeviceList()
